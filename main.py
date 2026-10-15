@@ -1,7 +1,7 @@
 
 # ============================================
 # 동네별 인구 피라미드
-# 초보자도 이해하기 쉽도록 한국어 주석을 달았습니다.
+# 지표 카드 3개 + 인구 비교 설명 + 고령화 주의 표시
 # ============================================
 
 import math
@@ -14,7 +14,6 @@ import streamlit as st
 # --------------------------------------------
 # 1. 기본 페이지 설정
 # --------------------------------------------
-
 st.set_page_config(
     page_title="동네별 인구 피라미드",
     page_icon="🏘️",
@@ -23,10 +22,8 @@ st.set_page_config(
 
 
 # --------------------------------------------
-# 2. 화면 디자인
-#    따뜻한 크림색과 노란색을 사용합니다.
+# 2. 따뜻한 크림색과 노란색으로 화면 꾸미기
 # --------------------------------------------
-
 st.markdown(
     """
     <style>
@@ -74,32 +71,27 @@ st.markdown(
 # --------------------------------------------
 # 3. 데이터 주소와 나이별 열 이름 준비
 # --------------------------------------------
-
 DATA_URL = (
     "https://raw.githubusercontent.com/"
     "first2022-cyber/contents/main/"
     "population_ts_yearly_gender.zip"
 )
 
-# 0세부터 99세까지, 그리고 100세 이상까지 총 101개 연령입니다.
+# 0세부터 99세까지, 그리고 100세 이상까지 총 101개 연령
 age_labels = [f"{age}세" for age in range(100)] + ["100세 이상"]
 
-# 데이터에서 사용할 남자·여자 인구 열 이름을 만듭니다.
+# 데이터의 열 이름 예시: 남_0세, 여_0세, 남_100세 이상
 male_columns = [f"남_{age}" for age in age_labels]
 female_columns = [f"여_{age}" for age in age_labels]
-
-# 그래프에 필요한 모든 인구 열입니다.
 age_columns = male_columns + female_columns
 
 
 # --------------------------------------------
-# 4. CSV 데이터를 읽어오는 함수
-#    압축된 ZIP 파일도 pandas로 읽습니다.
+# 4. ZIP 압축 CSV 데이터 불러오기
 # --------------------------------------------
-
 @st.cache_data(ttl=3600)
 def load_population_data():
-    # UTF-8 인코딩으로 먼저 읽고, 실패하면 CP949로 시도합니다.
+    # UTF-8로 먼저 읽고, 인코딩 오류가 나면 CP949로 다시 시도합니다.
     try:
         data = pd.read_csv(
             DATA_URL,
@@ -113,7 +105,7 @@ def load_population_data():
             encoding="cp949",
         )
 
-    # 열 이름 앞뒤의 공백과 BOM 문자를 정리합니다.
+    # 열 이름 앞뒤의 공백 및 BOM 문자를 정리합니다.
     data.columns = [
         str(column).replace("\ufeff", "").strip()
         for column in data.columns
@@ -123,9 +115,8 @@ def load_population_data():
 
 
 # --------------------------------------------
-# 5. 제목과 안내 문구
+# 5. 앱 제목과 설명
 # --------------------------------------------
-
 st.title("🏘️ 동네별 인구 피라미드")
 
 st.markdown(
@@ -133,7 +124,7 @@ st.markdown(
     우리 동네에는 연령별로 얼마나 많은 사람이 살고 있을까요?
 
     **시도 → 시군구 → 동** 순서로 지역을 선택하면
-    남성과 여성의 나이별 인구를 인구 피라미드로 확인할 수 있습니다.
+    남성과 여성의 나이별 인구, 평균연령, 고령화율을 확인할 수 있습니다.
     """
 )
 
@@ -143,7 +134,6 @@ st.divider()
 # --------------------------------------------
 # 6. 데이터 불러오기
 # --------------------------------------------
-
 try:
     with st.spinner("인구 데이터를 불러오는 중입니다..."):
         df = load_population_data()
@@ -160,7 +150,6 @@ except Exception as error:
 # --------------------------------------------
 # 7. 필요한 열이 있는지 확인
 # --------------------------------------------
-
 location_columns = ["연도", "시도", "시군구", "동"]
 
 missing_location_columns = [
@@ -195,10 +184,9 @@ if missing_age_columns:
 
 
 # --------------------------------------------
-# 8. 최신 연도만 남기기
+# 8. 데이터에 들어 있는 최신 연도만 사용
 # --------------------------------------------
-
-# 연도 열이 숫자 또는 '2026년' 형태여도 처리할 수 있게 합니다.
+# '2026년' 또는 '2026' 형태에서 연도 숫자를 추출합니다.
 df["_연도_숫자"] = pd.to_numeric(
     df["연도"]
     .astype(str)
@@ -206,25 +194,21 @@ df["_연도_숫자"] = pd.to_numeric(
     errors="coerce",
 )
 
-# 연도를 정상적으로 읽을 수 있는 데이터가 있는지 확인합니다.
 if df["_연도_숫자"].notna().sum() == 0:
     st.error("데이터에서 연도를 찾지 못했습니다.")
     st.stop()
 
-# 데이터에 실제로 들어 있는 가장 최신 연도를 자동으로 선택합니다.
+# 실제 데이터에 포함된 가장 최신 연도를 자동으로 선택합니다.
 latest_year = int(df["_연도_숫자"].max())
 
-# 최신 연도의 행만 사용합니다.
 latest_df = df.loc[
     df["_연도_숫자"] == latest_year
 ].copy()
 
 
 # --------------------------------------------
-# 9. 지역 이름 정리
-#    비어 있는 지역명은 '해당 없음'으로 표시합니다.
+# 9. 지역명과 인구값 정리
 # --------------------------------------------
-
 for column in ["시도", "시군구", "동"]:
     latest_df[column] = (
         latest_df[column]
@@ -234,12 +218,7 @@ for column in ["시도", "시군구", "동"]:
         .replace("", "해당 없음")
     )
 
-
-# --------------------------------------------
-# 10. 인구 데이터를 숫자로 변환
-#     천 단위 쉼표가 포함된 값도 처리합니다.
-# --------------------------------------------
-
+# 인구 열을 숫자로 변환합니다. 쉼표가 있는 숫자도 처리합니다.
 for column in age_columns:
     latest_df[column] = pd.to_numeric(
         latest_df[column]
@@ -251,18 +230,15 @@ for column in age_columns:
 
 
 # --------------------------------------------
-# 11. 드롭다운의 선택값을 안전하게 관리하는 함수
-#     상위 지역을 바꾸면 하위 지역도 유효한 값으로
-#     자동 변경되도록 합니다.
+# 10. 드롭다운의 선택값이 유효한지 확인
 # --------------------------------------------
-
 def set_valid_selection(key, options):
-    # 선택할 지역이 하나도 없다면 앱을 멈춥니다.
+    # 선택할 지역이 없으면 안내를 표시합니다.
     if not options:
         st.error("선택할 지역 데이터가 없습니다.")
         st.stop()
 
-    # 이전에 선택한 값이 새 목록에 없으면 첫 번째 지역을 선택합니다.
+    # 기존 선택값이 목록에 없다면 첫 번째 항목을 선택합니다.
     if (
         key not in st.session_state
         or st.session_state[key] not in options
@@ -271,9 +247,8 @@ def set_valid_selection(key, options):
 
 
 # --------------------------------------------
-# 12. 시도 → 시군구 → 동 드롭다운
+# 11. 시도 → 시군구 → 동 순서로 지역 선택
 # --------------------------------------------
-
 st.subheader("📍 지역 선택")
 
 # 첫 번째 드롭다운: 시도
@@ -287,16 +262,16 @@ selected_sido = st.selectbox(
     key="sido_select",
 )
 
-# 선택한 시도에 속한 시군구만 가져옵니다.
+# 선택한 시도에 속한 시군구만 표시합니다.
 sido_df = latest_df.loc[
     latest_df["시도"] == selected_sido
 ]
 
-# 두 번째 드롭다운: 시군구
 sigungu_options = sorted(
     sido_df["시군구"].unique().tolist()
 )
 
+# 두 번째 드롭다운: 시군구
 set_valid_selection("sigungu_select", sigungu_options)
 
 selected_sigungu = st.selectbox(
@@ -305,16 +280,16 @@ selected_sigungu = st.selectbox(
     key="sigungu_select",
 )
 
-# 선택한 시도와 시군구에 속한 동만 가져옵니다.
+# 선택한 시도와 시군구에 속한 동만 표시합니다.
 sigungu_df = sido_df.loc[
     sido_df["시군구"] == selected_sigungu
 ]
 
-# 세 번째 드롭다운: 동
 dong_options = sorted(
     sigungu_df["동"].unique().tolist()
 )
 
+# 세 번째 드롭다운: 동
 set_valid_selection("dong_select", dong_options)
 
 selected_dong = st.selectbox(
@@ -324,14 +299,12 @@ selected_dong = st.selectbox(
 )
 
 st.caption(f"📅 데이터 기준 연도: {latest_year}년")
-
 st.divider()
 
 
 # --------------------------------------------
-# 13. 선택한 동네의 인구 데이터 찾기
+# 12. 선택한 동네의 인구 데이터 찾기
 # --------------------------------------------
-
 selected_rows = latest_df.loc[
     (latest_df["시도"] == selected_sido)
     & (latest_df["시군구"] == selected_sigungu)
@@ -342,8 +315,7 @@ if selected_rows.empty:
     st.warning("선택한 지역의 인구 데이터가 없습니다.")
     st.stop()
 
-# 같은 지역에 해당하는 행이 여러 개라면 나이별 인구를 합산합니다.
-# 일반적인 경우에는 선택한 지역의 한 행을 사용합니다.
+# 같은 지역의 행이 여러 개라면 나이별 인구를 합산합니다.
 if len(selected_rows) == 1:
     population_by_age = selected_rows.iloc[0][age_columns]
 else:
@@ -351,10 +323,8 @@ else:
 
 
 # --------------------------------------------
-# 14. 그래프에 사용할 남성·여성 인구 만들기
+# 13. 남성·여성 인구와 추가 지표 계산
 # --------------------------------------------
-
-# 각 나이의 인구를 정수 목록으로 만듭니다.
 male_values = [
     int(round(population_by_age[column]))
     for column in male_columns
@@ -365,38 +335,123 @@ female_values = [
     for column in female_columns
 ]
 
-# 전체 남성·여성 인구를 계산합니다.
+# 같은 나이의 남성과 여성 인구를 더합니다.
+# 위치 0은 0세, 위치 100은 100세 이상입니다.
+population_by_age_total = [
+    male_values[index] + female_values[index]
+    for index in range(len(age_labels))
+]
+
+# 전체 남성·여성 인구
 total_male = sum(male_values)
 total_female = sum(female_values)
 total_population = total_male + total_female
 
 
 # --------------------------------------------
-# 15. 선택한 지역의 인구 요약
+# 평균연령 계산
 # --------------------------------------------
+# 나이별 인구에 해당 나이를 곱한 뒤 모두 더하고
+# 전체 인구수로 나눕니다.
+#
+# '100세 이상'은 계산을 위해 100세로 가정합니다.
+# 따라서 평균연령은 추정값입니다.
+if total_population > 0:
+    average_age = (
+        sum(
+            age * population
+            for age, population in enumerate(population_by_age_total)
+        )
+        / total_population
+    )
+else:
+    average_age = None
 
+
+# --------------------------------------------
+# 고령화율 계산
+# --------------------------------------------
+# 고령화율 = 65세 이상 인구 / 전체 인구 × 100
+elderly_population = sum(population_by_age_total[65:])
+
+elderly_rate = (
+    elderly_population / total_population * 100
+    if total_population > 0
+    else 0.0
+)
+
+
+# --------------------------------------------
+# 아이 인구 계산
+# --------------------------------------------
+# 아이 인구는 0~14세로 정의합니다.
+child_population = sum(population_by_age_total[:15])
+
+child_rate = (
+    child_population / total_population * 100
+    if total_population > 0
+    else 0.0
+)
+
+
+# --------------------------------------------
+# 14. 지역 이름과 지표 카드 3개
+# --------------------------------------------
 st.subheader(
     f"📊 {selected_sido} · {selected_sigungu} · {selected_dong}"
 )
 
+# 세 카드를 같은 줄에 나란히 배치합니다.
 metric1, metric2, metric3 = st.columns(3)
 
-metric1.metric("전체 인구", f"{total_population:,}명")
-metric2.metric("남성 인구", f"{total_male:,}명")
-metric3.metric("여성 인구", f"{total_female:,}명")
+with metric1:
+    st.metric(
+        label="👥 총인구",
+        value=f"{total_population:,}명",
+    )
+
+with metric2:
+    if average_age is None:
+        st.metric(
+            label="🎂 평균연령",
+            value="계산 불가",
+        )
+    else:
+        st.metric(
+            label="🎂 평균연령",
+            value=f"{average_age:.1f}세",
+        )
+
+with metric3:
+    # 고령화율이 20%를 초과하면 카드에 주의 표시를 붙입니다.
+    if elderly_rate > 20:
+        elderly_label = "⚠️ 고령화율 · 주의"
+    else:
+        elderly_label = "🌱 고령화율"
+
+    st.metric(
+        label=elderly_label,
+        value=f"{elderly_rate:.1f}%",
+        help=(
+            "전체 인구 중 65세 이상 인구의 비율입니다. "
+            "20%를 초과하면 주의 표시를 합니다."
+        ),
+    )
+
+    if elderly_rate > 20:
+        st.caption("⚠️ 고령화율이 20%를 초과합니다.")
 
 
 # --------------------------------------------
-# 16. Plotly 인구 피라미드 만들기
+# 15. Plotly 인구 피라미드 만들기
 # --------------------------------------------
-
-# 남성 인구는 음수로 만들어 왼쪽에 표시합니다.
-# 여성 인구는 양수로 만들어 오른쪽에 표시합니다.
+# 남성은 음수로 만들어 왼쪽에,
+# 여성은 양수로 만들어 오른쪽에 표시합니다.
 male_negative = [-value for value in male_values]
 
 fig = go.Figure()
 
-# 남성 막대: 왼쪽
+# 남성 인구 막대
 fig.add_trace(
     go.Bar(
         name="남성",
@@ -413,7 +468,7 @@ fig.add_trace(
     )
 )
 
-# 여성 막대: 오른쪽
+# 여성 인구 막대
 fig.add_trace(
     go.Bar(
         name="여성",
@@ -432,17 +487,15 @@ fig.add_trace(
 
 
 # --------------------------------------------
-# 17. 가로축 눈금 설정
-#     양쪽 모두 인구수를 양수로 표시합니다.
+# 16. 가로축 범위와 눈금 설정
 # --------------------------------------------
-
+# 좌우 범위를 동일하게 설정해 피라미드를 대칭으로 만듭니다.
 max_population = max(
     max(male_values),
     max(female_values),
     1,
 )
 
-# 눈금 간격을 계산하여 그래프가 좌우 대칭이 되게 합니다.
 tick_step = max(1, math.ceil(max_population / 2))
 axis_limit = tick_step * 2
 
@@ -454,7 +507,7 @@ tick_values = [
     axis_limit,
 ]
 
-# 왼쪽 축도 음수 기호 없이 인구수로 표시합니다.
+# 왼쪽의 음수도 눈금에는 양수 인구수로 표시합니다.
 tick_text = [
     f"{abs(value):,}"
     for value in tick_values
@@ -462,9 +515,8 @@ tick_text = [
 
 
 # --------------------------------------------
-# 18. 그래프 디자인과 축 순서 설정
+# 17. 그래프 디자인
 # --------------------------------------------
-
 fig.update_layout(
     title={
         "text": "연령별 남녀 인구 피라미드",
@@ -500,7 +552,10 @@ fig.update_layout(
 # 가로축: 인구수
 fig.update_xaxes(
     title_text="인구 수 (명)",
-    range=[-axis_limit * 1.1, axis_limit * 1.1],
+    range=[
+        -axis_limit * 1.1,
+        axis_limit * 1.1,
+    ],
     tickmode="array",
     tickvals=tick_values,
     ticktext=tick_text,
@@ -511,20 +566,19 @@ fig.update_xaxes(
     zerolinewidth=2,
 )
 
-# --------------------------------------------
-# ★ 가장 중요한 세로축 설정 ★
-#
-# age_labels는 0세, 1세, ... 99세, 100세 이상 순서입니다.
-# categoryorder="array"와 categoryarray로 이 순서를 고정합니다.
-#
-# y축 전체를 뒤집는 autorange="reversed"는 사용하지 않습니다.
-# 값의 크기순 정렬도 사용하지 않습니다.
-#
-# Plotly의 세로축은 낮은 범주가 아래쪽에 놓이므로
-# 첫 번째 범주인 0세가 맨 아래에 표시되고,
-# 마지막 범주인 100세 이상이 맨 위에 표시됩니다.
-# --------------------------------------------
 
+# --------------------------------------------
+# ★ 중요: 세로축 나이 순서 고정
+# --------------------------------------------
+# 나이 라벨을 0세부터 100세 이상까지 순서대로 지정합니다.
+# categoryorder="array"와 categoryarray로 순서를 고정합니다.
+#
+# 축 전체를 뒤집는 autorange="reversed"는 사용하지 않습니다.
+# 인구수 크기순 정렬도 사용하지 않습니다.
+#
+# 결과:
+# 맨 아래 = 0세
+# 맨 위 = 100세 이상
 fig.update_yaxes(
     title_text="나이",
     categoryorder="array",
@@ -533,7 +587,10 @@ fig.update_yaxes(
     tickfont={"size": 10},
 )
 
-# 그래프 표시
+
+# --------------------------------------------
+# 18. 그래프 출력
+# --------------------------------------------
 st.plotly_chart(
     fig,
     use_container_width=True,
@@ -545,23 +602,44 @@ st.plotly_chart(
 
 
 # --------------------------------------------
-# 19. 그래프 읽는 방법
+# 19. 아이와 어르신 인구 비교 설명
 # --------------------------------------------
-
 st.markdown(
-    """
-    ### 💡 그래프 읽는 방법
-
-    - **왼쪽 주황색 막대:** 남성 인구
-    - **오른쪽 노란색 막대:** 여성 인구
-    - **세로축:** 아래쪽은 0세, 위쪽은 100세 이상
-    - **가로축:** 각 나이에 해당하는 인구수
-
-    막대에 마우스를 올리면 나이별 정확한 인구수를 확인할 수 있습니다.
-    """
+    "### 🧭 이 동네는 아이가 많은 편인가요, 어르신이 많은 편인가요?"
 )
 
+if total_population == 0:
+    st.write(
+        "이 동네의 인구 데이터가 없어 "
+        "아이와 어르신의 비율을 비교할 수 없습니다."
+    )
+
+elif child_population > elderly_population:
+    st.write(
+        f"이 동네는 65세 이상 어르신({elderly_population:,}명)보다 "
+        f"0~14세 아이({child_population:,}명)가 더 많아, "
+        "상대적으로 아이가 많은 편이에요."
+    )
+
+elif elderly_population > child_population:
+    st.write(
+        f"이 동네는 0~14세 아이({child_population:,}명)보다 "
+        f"65세 이상 어르신({elderly_population:,}명)이 더 많아, "
+        "상대적으로 어르신이 많은 편이에요."
+    )
+
+else:
+    st.write(
+        f"이 동네는 0~14세 아이와 65세 이상 어르신이 "
+        f"각각 {child_population:,}명으로 같아요."
+    )
+
+
+# --------------------------------------------
+# 20. 자료 및 계산 기준 안내
+# --------------------------------------------
 st.caption(
     "자료: 지정된 인구 CSV 데이터 · "
-    f"표시 연도: {latest_year}년"
+    f"표시 연도: {latest_year}년 · "
+    "평균연령 계산에서 100세 이상은 100세로 가정했습니다."
 )
