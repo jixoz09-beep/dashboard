@@ -1,7 +1,7 @@
 import re
 
 import pandas as pd
-import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 
@@ -20,10 +20,8 @@ GEOJSON_URL = (
     "sigungu_kr.geojson"
 )
 
-TARGET_YEAR = "2026"
-
 st.set_page_config(
-    page_title="전국 고령화 단계구분도",
+    page_title="전국 고령화·유소년 비율 단계구분도",
     page_icon="🗺️",
     layout="wide",
 )
@@ -52,35 +50,69 @@ st.markdown(
 
 
 # ==========================================
-# 2. 지역 코드 문자열 정리
+# 2. 지역 코드 처리
 # ==========================================
 
 def normalize_code(value) -> str:
-    """지역 코드를 문자열로 통일하고 필요한 경우 앞에 0을 채운다."""
+    """코드를 문자열로 정리한다."""
 
     if value is None or pd.isna(value):
         return ""
 
     code = str(value).strip()
 
-    # 숫자가 실수 형태로 읽힌 경우 처리
     if code.endswith(".0"):
         code = code[:-2]
-
-    # 숫자형 코드의 앞자리 0이 사라진 경우 보정
-    if code.isdigit() and len(code) < 5:
-        code = code.zfill(5)
 
     return code
 
 
+def canonicalize_sgg_code(value) -> str:
+    """시군구 5자리 코드를 현행 경계 코드로 보정한다."""
+
+    code = normalize_code(value)
+
+    if not code:
+        return ""
+
+    if code.isdigit() and len(code) < 5:
+        code = code.zfill(5)
+
+    if len(code) > 5:
+        code = code[:5]
+
+    # 행정구역 개편 코드 보정
+    if code == "47720":
+        code = "27720"  # 군위군
+    elif code.startswith("42"):
+        code = "51" + code[2:]  # 옛 강원도 코드
+    elif code.startswith("45"):
+        code = "52" + code[2:]  # 옛 전라북도 코드
+
+    return code
+
+
+def sgg_code_from_dong(value) -> str:
+    """읍·면·동 코드 앞 5자리에서 시군구 코드를 만든다."""
+
+    code = normalize_code(value)
+
+    if not code:
+        return ""
+
+    if code.isdigit() and len(code) < 5:
+        code = code.zfill(5)
+
+    return canonicalize_sgg_code(code[:5])
+
+
 # ==========================================
-# 3. 인구 데이터 불러오기 및 계산
+# 3. 인구 데이터 읽기
 # ==========================================
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def load_population() -> pd.DataFrame:
-    """2026년 인구 자료를 읽어 시군구별 고령화율을 계산한다."""
+def load_population_data():
+    """ZIP CSV를 읽고 연도·나이별 열을 준비한다."""
 
     df = pd.read_csv(
         POPULATION_URL,
@@ -89,68 +121,73 @@ def load_population() -> pd.DataFrame:
         low_memory=False,
     )
 
-    # 열 이름의 앞뒤 공백 제거
     df.columns = [str(col).strip() for col in df.columns]
 
-    # 필수 열 확인
-    required_columns = {"연도", "코드"}
-    missing_columns = required_columns - set(df.columns)
+    required = {"연도", "코드"}
+    missing = required - set(df.columns)
 
-    if missing_columns:
+    if missing:
         raise ValueError(
-            "필수 열이 없습니다: "
-            + ", ".join(sorted(missing_columns))
+            "인구 자료에 필요한 열이 없습니다: "
+            + ", ".join(sorted(missing))
         )
 
-    # 2026년 데이터만 선택
-    year_values = (
-        df["연도"]
-        .astype("string")
-        .str.extract(r"(\d{4})", expand=False)
+    # 연도값이 숫자 또는 '2026년' 형태여도 연도를 추출한다.
+    year_text = df["연도"].astype("string").str.extract(
+        r"(\d{4})", expand=False
     )
 
-    df = df.loc[year_values.eq(TARGET_YEAR)].copy()
+    df["_연도"] = pd.to_numeric(year_text, errors="coerce")
 
-    if df.empty:
-        raise ValueError(
-            "인구 데이터에서 2026년 자료를 찾지 못했습니다."
-        )
-
-    # '계_'로 시작하는 열만 전체 인구 계산에 사용
-    # 남_ 및 여_ 열은 더하지 않는다.
-    total_columns = [
-        col
-        for col in df.columns
-        if col.startswith("계_")
+    # 전체 인구는 '계_'로 시작하는 열만 합산한다.
+    total_cols = [
+        col for col in df.columns if col.startswith("계_")
     ]
 
-    if not total_columns:
+    if not total_cols:
         raise ValueError(
-            "'계_'로 시작하는 인구 열이 없습니다."
+            "'계_'로 시작하는 인구 열을 찾지 못했습니다."
         )
 
-    # 65세 이상 인구에 해당하는 열 찾기
-    # 예: 계_65세, 계_66세, ..., 계_100세 이상
-    senior_columns = []
+    # 열 이름에서 나이를 추출한다.
+    # '계_100세 이상'도 정상적으로 인식한다.
+    age_by_col = {}
 
-    for col in total_columns:
+    for col in total_cols:
         match = re.fullmatch(
             r"계_(\d+)세(?:\s*이상)?",
             col.strip(),
         )
 
-        if match and int(match.group(1)) >= 65:
-            senior_columns.append(col)
+        if match:
+            age_by_col[col] = int(match.group(1))
 
-    if not senior_columns:
+    senior_cols = [
+        col
+        for col, age in age_by_col.items()
+        if age >= 65
+    ]
+
+    child_cols = [
+        col
+        for col, age in age_by_col.items()
+        if 0 <= age <= 14
+    ]
+
+    if not senior_cols:
         raise ValueError(
-            "65세 이상 인구 열을 찾지 못했습니다. "
-            "원본 데이터의 열 이름을 확인해 주세요."
+            "'계_65세'부터 '계_100세 이상'까지의 "
+            "열을 찾지 못했습니다."
         )
 
-    # 인구 데이터를 숫자로 변환
-    # 혹시 쉼표가 들어간 숫자 문자열이 있어도 처리
-    for col in total_columns:
+    if not child_cols:
+        raise ValueError(
+            "'계_0세'부터 '계_14세'까지의 "
+            "열을 찾지 못했습니다."
+        )
+
+    # 인구 열을 숫자로 변환한다.
+    for col in total_cols:
         df[col] = pd.to_numeric(
             df[col]
             .astype("string")
@@ -158,55 +195,33 @@ def load_population() -> pd.DataFrame:
             errors="coerce",
         ).fillna(0)
 
-    # 읍·면·동별 전체 인구
-    df["전체 인구"] = df[total_columns].sum(axis=1)
-
-    # 읍·면·동별 65세 이상 인구
-    df["65세 이상 인구"] = df[senior_columns].sum(axis=1)
-
-    # 동 코드의 앞 5자리를 시군구 코드로 사용
-    df["동코드"] = df["코드"].map(normalize_code)
-
-    df["시군구코드"] = (
-        df["동코드"]
+    # 동 코드 앞 5자리로 시군구 코드를 만들고 개편 코드를 보정한다.
+    df["_시군구코드"] = (
+        df["코드"]
+        .map(sgg_code_from_dong)
         .astype("string")
-        .str[:5]
     )
 
-    df = df.loc[
-        df["시군구코드"].notna()
-        & df["시군구코드"].ne("")
-    ].copy()
-
-    # 시군구별 인구 합산
-    grouped = (
-        df.groupby("시군구코드", as_index=False)[
-            ["65세 이상 인구", "전체 인구"]
-        ]
-        .sum()
+    years = sorted(
+        int(year)
+        for year in df["_연도"].dropna().unique()
     )
 
-    # 고령화율 = 65세 이상 인구 / 전체 인구 × 100
-    denominator = grouped["전체 인구"].where(
-        grouped["전체 인구"] > 0
-    )
+    if not years:
+        raise ValueError(
+            "인구 자료에서 유효한 연도를 찾지 못했습니다."
+        )
 
-    grouped["고령화율(%)"] = (
-        grouped["65세 이상 인구"]
-        .div(denominator)
-        .mul(100)
-    )
-
-    return grouped
+    return df, total_cols, senior_cols, child_cols, years
 
 
 # ==========================================
-# 4. 시군구 경계 GeoJSON 불러오기
+# 4. 시군구 경계 GeoJSON 읽기
 # ==========================================
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def load_geojson() -> dict:
-    """시군구 경계 GeoJSON을 내려받고 코드 형식을 통일한다."""
+def load_geojson():
+    """requests로 GeoJSON을 받고 코드를 문자열로 정리한다."""
 
     response = requests.get(
         GEOJSON_URL,
@@ -228,67 +243,130 @@ def load_geojson() -> dict:
     for feature in geojson["features"]:
         properties = feature.setdefault("properties", {})
 
-        # 경계 코드도 문자열로 통일
-        properties["코드"] = normalize_code(
+        properties["코드"] = canonicalize_sgg_code(
             properties.get("코드")
         )
 
     return geojson
 
 
-# ==========================================
-# 5. 코드로 인구 자료와 경계 자료 결합
-# ==========================================
+def geo_metadata(geojson) -> pd.DataFrame:
+    """GeoJSON에서 코드·시군구·시도 정보를 만든다."""
 
-def build_map_data(
-    geojson: dict,
-    population_stats: pd.DataFrame,
-) -> pd.DataFrame:
-    """지역명이 아니라 시군구 코드로 두 자료를 결합한다."""
-
-    geo_rows = []
+    rows = []
 
     for feature in geojson["features"]:
         properties = feature.get("properties", {})
 
-        code = normalize_code(properties.get("코드"))
+        code = canonicalize_sgg_code(
+            properties.get("코드")
+        )
 
-        # 코드가 없는 경계는 제외
         if not code:
             continue
 
-        geo_rows.append(
+        rows.append(
             {
                 "코드": code,
-                "시군구": properties.get("시군구", "이름 없음"),
-                "시도": properties.get("시도", ""),
+                "시군구": str(
+                    properties.get("시군구", "이름 없음")
+                ),
+                "시도": str(
+                    properties.get("시도", "")
+                ),
             }
         )
 
-    geo_df = pd.DataFrame(geo_rows)
+    meta = pd.DataFrame(rows)
 
-    if geo_df.empty:
+    if meta.empty:
         raise ValueError(
-            "GeoJSON에서 시군구 코드를 찾지 못했습니다."
+            "GeoJSON에서 시군구 코드 정보를 찾지 못했습니다."
         )
 
-    # 경계 코드 중복 제거
-    geo_df = geo_df.drop_duplicates(
-        subset=["코드"]
+    return meta.drop_duplicates(subset=["코드"])
+
+
+# ==========================================
+# 5. 연도·지표별 시군구 통계
+# ==========================================
+
+def calculate_sgg_rates(
+    df: pd.DataFrame,
+    total_cols: list,
+    numerator_cols: list,
+    selected_year: int,
+):
+    """선택 연도의 시군구 비율과 전국 비율을 계산한다."""
+
+    year_df = df.loc[
+        df["_연도"].eq(selected_year)
+    ].copy()
+
+    if year_df.empty:
+        raise ValueError(
+            f"{selected_year}년 인구 자료가 없습니다."
+        )
+
+    # 전체 인구와 선택 지표의 인구를 계산한다.
+    year_df["_전체인구"] = year_df[total_cols].sum(axis=1)
+
+    year_df["_지표인구"] = year_df[numerator_cols].sum(axis=1)
+
+    # 전국 비율은 전체 인구를 기준으로 계산한다.
+    national_total = float(
+        year_df["_전체인구"].sum()
     )
 
-    stats = population_stats.copy()
-
-    stats["시군구코드"] = (
-        stats["시군구코드"]
-        .map(normalize_code)
+    national_numerator = float(
+        year_df["_지표인구"].sum()
     )
 
-    # 반드시 코드로 결합
-    map_df = geo_df.merge(
+    national_rate = (
+        national_numerator / national_total * 100
+        if national_total > 0
+        else None
+    )
+
+    # 유효한 시군구 코드만 묶는다.
+    usable = year_df.loc[
+        year_df["_시군구코드"].notna()
+        & year_df["_시군구코드"].ne("")
+    ].copy()
+
+    stats = (
+        usable.groupby("_시군구코드", as_index=False)
+        .agg(
+            **{
+                "지표 인구": ("_지표인구", "sum"),
+                "전체 인구": ("_전체인구", "sum"),
+            }
+        )
+    )
+
+    denominator = stats["전체 인구"].where(
+        stats["전체 인구"] > 0
+    )
+
+    stats["지표 비율(%)"] = (
+        stats["지표 인구"]
+        .div(denominator)
+        .mul(100)
+    )
+
+    return stats, national_rate
+
+
+def build_map_data(geojson, stats) -> pd.DataFrame:
+    """경계 데이터와 인구 통계를 코드 기준으로 결합한다."""
+
+    meta = geo_metadata(geojson)
+
+    # 지역 이름이 아닌 코드로 결합한다.
+    map_df = meta.merge(
         stats,
         left_on="코드",
-        right_on="시군구코드",
+        right_on="_시군구코드",
         how="left",
     )
 
@@ -296,37 +374,37 @@ def build_map_data(
 
 
 # ==========================================
-# 6. 앱 화면
+# 6. 앱 제목 및 자료 로딩
 # ==========================================
 
-st.title("🗺️ 전국 고령화 단계구분도")
+st.title("🗺️ 전국 고령화·유소년 비율 단계구분도")
 
 st.write(
-    "2026년 인구 데이터를 이용해 전국 시군구별 "
-    "65세 이상 인구 비율을 지도에 표시합니다. "
-    "색이 진할수록 고령화율이 높습니다."
+    "연도와 지표를 선택해 시군구별 인구 비율을 비교해 보세요. "
+    "색 구간은 연도가 바뀌어도 고정되어 있어 "
+    "연도별 차이를 비교할 수 있습니다."
 )
 
 st.caption(
-    "인구 데이터: 제공된 연도별 인구 ZIP CSV | "
-    "경계 데이터: 제공된 시군구 GeoJSON"
+    "인구 자료: 제공된 연도별 인구 ZIP CSV · "
+    "경계 자료: 제공된 시군구 GeoJSON"
 )
 
-
-# ==========================================
-# 7. 데이터 불러오기
-# ==========================================
-
-with st.spinner("인구 자료와 시군구 경계를 불러오는 중입니다..."):
+with st.spinner(
+    "인구 자료와 시군구 경계를 불러오는 중입니다..."
+):
     try:
-        population_stats = load_population()
+        (
+            population_df,
+            total_cols,
+            senior_cols,
+            child_cols,
+            available_years,
+        ) = load_population_data()
 
         geojson_data = load_geojson()
 
-        map_data = build_map_data(
-            geojson_data,
-            population_stats,
-        )
+        metadata_df = geo_metadata(geojson_data)
 
     except Exception as exc:
         st.error(
@@ -341,102 +419,381 @@ with st.spinner("인구 자료와 시군구 경계를 불러오는 중입니다.
 
 
 # ==========================================
-# 8. 연결된 시군구 확인
+# 7. 연도·지표·시도 선택
 # ==========================================
 
-matched = map_data["고령화율(%)"].notna()
+control_year, control_metric, control_sido = st.columns(
+    [2, 1, 1]
+)
 
-plot_data = map_data.loc[matched].copy()
+selected_year = control_year.slider(
+    "연도",
+    min_value=int(min(available_years)),
+    max_value=int(max(available_years)),
+    value=int(max(available_years)),
+    step=1,
+)
 
-matched_count = len(plot_data)
+metric_choice = control_metric.selectbox(
+    "지표 선택",
+    [
+        "65세 이상 비율 (고령화율)",
+        "0~14세 비율 (유소년)",
+    ],
+)
 
-geo_count = map_data["코드"].nunique()
+sido_values = sorted(
+    value.strip()
+    for value in metadata_df["시도"].dropna().astype(str).unique()
+    if value.strip()
+)
 
-if plot_data.empty:
-    st.error(
-        "인구 데이터와 GeoJSON 경계의 코드가 일치하지 않습니다. "
-        "두 파일의 코드 형식을 확인해 주세요."
+sido_options = ["전국"] + sido_values
+
+selected_sido = control_sido.selectbox(
+    "시도 선택",
+    sido_options,
+    index=0,
+)
+
+
+# ==========================================
+# 8. 지표별 고정 색 구간 설정
+# ==========================================
+
+if metric_choice == "65세 이상 비율 (고령화율)":
+
+    numerator_cols = senior_cols
+
+    rate_label = "고령화율"
+
+    national_metric_label = "전국 고령화율"
+
+    # 고령화율 구간은 모든 연도에서 고정한다.
+    thresholds = [19, 23, 28, 38]
+
+    band_labels = [
+        "<19%",
+        "19–23%",
+        "23–28%",
+        "28–38%",
+        "≥38%",
+    ]
+
+    metric_table_label = "고령화율(%)"
+
+else:
+
+    numerator_cols = child_cols
+
+    rate_label = "유소년 비율"
+
+    national_metric_label = "전국 유소년 비율"
+
+    # 유소년 비율에 맞는 별도 구간을 사용한다.
+    thresholds = [6, 9, 12, 15]
+
+    band_labels = [
+        "<6%",
+        "6–9%",
+        "9–12%",
+        "12–15%",
+        "≥15%",
+    ]
+
+metric_table_label = (
+    "고령화율(%)"
+    if rate_label == "고령화율"
+    else "유소년 비율(%)"
+)
+
+# 낮은 비율부터 높은 비율 순서로 색상을 고정한다.
+band_colors = {
+    band_labels[0]: "#fff7bc",
+    band_labels[1]: "#fee391",
+    band_labels[2]: "#fec44f",
+    band_labels[3]: "#fe9929",
+    band_labels[4]: "#8c2d04",
+}
+
+
+# ==========================================
+# 9. 선택 연도·지표 계산
+# ==========================================
+
+try:
+    stats, national_rate = calculate_sgg_rates(
+        population_df,
+        total_cols,
+        numerator_cols,
+        selected_year,
     )
+
+    map_data = build_map_data(
+        geojson_data,
+        stats,
+    )
+
+except Exception as exc:
+    st.error(
+        "선택한 연도의 통계를 계산하지 못했습니다."
+    )
+
+    with st.expander("오류 상세 보기"):
+        st.exception(exc)
+
     st.stop()
 
 
 # ==========================================
-# 9. 상단 지표 카드
+# 10. 시도별 지도 범위 선택
+# ==========================================
+
+if selected_sido == "전국":
+
+    view_data = map_data.copy()
+
+    view_features = list(
+        geojson_data["features"]
+    )
+
+else:
+
+    view_data = map_data.loc[
+        map_data["시도"].eq(selected_sido)
+    ].copy()
+
+    view_features = [
+        feature
+        for feature in geojson_data["features"]
+        if str(
+            feature.get("properties", {}).get("시도", "")
+        ).strip() == selected_sido
+    ]
+
+
+# 선택된 지역만 GeoJSON으로 구성하여 지도 확대에 사용한다.
+view_geojson = {
+    key: value
+    for key, value in geojson_data.items()
+    if key != "features"
+}
+
+view_geojson["features"] = view_features
+
+# 공통 지표 비율 열
+view_data["_비율"] = pd.to_numeric(
+    view_data["지표 비율(%)"],
+    errors="coerce",
+)
+
+matched_data = view_data.loc[
+    view_data["_비율"].notna()
+].copy()
+
+unmatched_data = view_data.loc[
+    view_data["_비율"].isna()
+].copy()
+
+
+# ==========================================
+# 11. 고정 구간에 따라 색상 분류
+# ==========================================
+
+if not matched_data.empty:
+
+    matched_data["색 구간"] = pd.cut(
+        matched_data["_비율"],
+        bins=[
+            float("-inf"),
+            *thresholds,
+            float("inf"),
+        ],
+        labels=band_labels,
+        right=False,
+        ordered=True,
+    ).astype(str)
+
+
+# ==========================================
+# 12. 지표 카드 3장
 # ==========================================
 
 metric1, metric2, metric3 = st.columns(3)
 
+national_display = (
+    f"{national_rate:.2f}%"
+    if national_rate is not None
+    else "계산 불가"
+)
+
 metric1.metric(
-    "표시된 시군구",
-    f"{matched_count:,}곳",
+    national_metric_label,
+    national_display,
 )
 
-average_rate = plot_data["고령화율(%)"].mean()
+if not matched_data.empty:
 
-metric2.metric(
-    "표시 지역의 평균 고령화율",
-    f"{average_rate:.2f}%",
-)
+    highest = matched_data.loc[
+        matched_data["_비율"].idxmax()
+    ]
 
-max_row = plot_data.loc[
-    plot_data["고령화율(%)"].idxmax()
-]
+    lowest = matched_data.loc[
+        matched_data["_비율"].idxmin()
+    ]
 
-metric3.metric(
-    "고령화율 최고 지역",
-    str(max_row["시군구"]),
-    f"{max_row['고령화율(%)']:.2f}%",
+    metric2.metric(
+        "가장 높은 시군구",
+        str(highest["시군구"]),
+        f"{highest['_비율']:.2f}%",
+    )
+
+    metric3.metric(
+        "가장 낮은 시군구",
+        str(lowest["시군구"]),
+        f"{lowest['_비율']:.2f}%",
+    )
+
+else:
+
+    metric2.metric(
+        "가장 높은 시군구",
+        "자료 없음",
+    )
+
+    metric3.metric(
+        "가장 낮은 시군구",
+        "자료 없음",
+    )
+
+st.caption(
+    f"지도 범위: {selected_sido} · "
+    "시군구 최고·최저는 현재 지도에 표시된 지역 중에서 계산합니다."
 )
 
 
 # ==========================================
-# 10. Plotly 단계구분도
+# 13. Plotly 단계구분도
 # ==========================================
 
-fig = px.choropleth(
-    plot_data,
-    geojson=geojson_data,
-    locations="코드",
-    featureidkey="properties.코드",
-    color="고령화율(%)",
-    color_continuous_scale=[
-        [0.00, "#fff7bc"],
-        [0.20, "#fee391"],
-        [0.40, "#fec44f"],
-        [0.60, "#fe9929"],
-        [0.80, "#d95f0e"],
-        [1.00, "#8c2d04"],
-    ],
-    hover_name="시군구",
-    hover_data={
-        "코드": False,
-        "시군구코드": False,
-        "시도": False,
-        "65세 이상 인구": False,
-        "전체 인구": False,
-        "고령화율(%)": False,
-    },
-    labels={
-        "고령화율(%)": "고령화율",
-    },
-)
+fig = go.Figure()
 
-# 마우스를 올렸을 때 시군구 이름과 고령화율 표시
-fig.update_traces(
-    marker_line_color="#fffaf0",
-    marker_line_width=0.7,
-    customdata=plot_data[["시군구"]].to_numpy(),
-    hovertemplate=(
-        "<b>%{customdata[0]}</b><br>"
-        "고령화율: %{z:.2f}%"
-        "<extra></extra>"
-    ),
-)
 
-# 배경 타일 없이 GeoJSON 경계만 표시
+# ------------------------------------------
+# 13-1. 자료가 연결되지 않은 지역은 회색으로 표시
+# ------------------------------------------
+
+if not unmatched_data.empty:
+
+    fig.add_trace(
+        go.Choropleth(
+            geojson=view_geojson,
+
+            locations=(
+                unmatched_data["코드"]
+                .astype(str)
+                .tolist()
+            ),
+
+            featureidkey="properties.코드",
+
+            z=[0] * len(unmatched_data),
+
+            zmin=0,
+            zmax=1,
+
+            colorscale=[
+                [0, "#c7c7c7"],
+                [1, "#c7c7c7"],
+            ],
+
+            showscale=False,
+
+            name="자료 없음 / 코드 불일치",
+            showlegend=True,
+
+            marker_line_color="#fffaf0",
+            marker_line_width=0.7,
+
+            customdata=unmatched_data[
+                ["시군구", "시도", "코드"]
+            ].to_numpy(),
+
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "%{customdata[1]}<br>"
+                "자료 없음 또는 코드 불일치"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+
+# ------------------------------------------
+# 13-2. 각 색 구간을 고정 색상으로 표시
+# ------------------------------------------
+
+for band in band_labels:
+
+    subset = matched_data.loc[
+        matched_data["색 구간"].eq(band)
+    ].copy()
+
+    color = band_colors[band]
+
+    fig.add_trace(
+        go.Choropleth(
+            geojson=view_geojson,
+
+            locations=(
+                subset["코드"]
+                .astype(str)
+                .tolist()
+            ),
+
+            featureidkey="properties.코드",
+
+            # 각 구간에 단일 색상을 지정한다.
+            z=[0] * len(subset),
+
+            zmin=0,
+            zmax=1,
+
+            colorscale=[
+                [0, color],
+                [1, color],
+            ],
+
+            showscale=False,
+
+            name=band,
+            showlegend=True,
+
+            marker_line_color="#fffaf0",
+            marker_line_width=0.7,
+
+            customdata=subset[
+                ["시군구", "_비율"]
+            ].to_numpy(),
+
+            hovertemplate=(
+                f"<b>%{{customdata[0]}}</b><br>"
+                f"{rate_label}: %{{customdata[1]:.2f}}%"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+
+# ------------------------------------------
+# 13-3. 지도 디자인 및 확대
+# ------------------------------------------
+
 fig.update_geos(
     fitbounds="locations",
+    visible=False,
     projection_type="mercator",
+
     showframe=False,
     showcoastlines=False,
     showcountries=False,
@@ -444,25 +801,35 @@ fig.update_geos(
     showocean=False,
     showlakes=False,
     showrivers=False,
+
     bgcolor="rgba(0,0,0,0)",
 )
 
 fig.update_layout(
     height=760,
+
     margin={
         "l": 0,
         "r": 0,
-        "t": 20,
-        "b": 0,
+        "t": 15,
+        "b": 20,
     },
+
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="rgba(0,0,0,0)",
-    coloraxis_colorbar={
+
+    legend={
         "title": {
-            "text": "고령화율(%)",
+            "text": f"{rate_label} 구간",
         },
-        "ticksuffix": "%",
-        "thickness": 16,
+        "orientation": "h",
+        "yanchor": "bottom",
+        "y": -0.02,
+        "xanchor": "left",
+        "x": 0,
+        "font": {
+            "size": 12,
+        },
     },
 )
 
@@ -477,63 +844,85 @@ st.plotly_chart(
 
 
 # ==========================================
-# 11. 데이터 연결 상태
+# 14. 지도 아래 코드 불일치 안내
 # ==========================================
 
-unmatched_count = max(
-    geo_count - matched_count,
-    0,
-)
+if not unmatched_data.empty:
 
-if unmatched_count > 0:
     st.warning(
-        f"전체 경계 {geo_count:,}곳 중 "
-        f"{matched_count:,}곳이 인구 자료와 연결되었습니다. "
-        f"연결되지 않은 경계는 {unmatched_count:,}곳입니다. "
-        "자료의 코드 형식과 지역 범위를 확인해 주세요."
+        f"회색으로 표시된 지역 {len(unmatched_data):,}곳은 "
+        f"{selected_year}년 인구 자료와 경계 코드가 연결되지 않아 "
+        "비율을 계산하지 못한 곳입니다. "
+        "옛 시도 코드 42→51, 45→52와 군위군 코드 "
+        "47720→27720은 보정했습니다. "
+        "그래도 일치하지 않는 지역은 회색으로 남겨 두었습니다. "
+        "자료에 해당 지역이 없거나 추가적인 행정구역 코드 변경이 "
+        "원인일 수 있습니다."
+    )
+
+else:
+
+    st.caption(
+        "회색은 선택 연도 인구 자료와 코드가 연결되지 않은 지역을 뜻합니다. "
+        "현재 지도 범위에서는 연결되지 않은 지역이 없습니다."
     )
 
 
 # ==========================================
-# 12. 시군구별 상세 통계표
+# 15. 시군구별 상세 통계표
 # ==========================================
 
-with st.expander("📊 시군구별 고령화율 표 보기"):
-    table = plot_data[
-        [
-            "시도",
-            "시군구",
-            "코드",
-            "65세 이상 인구",
-            "전체 인구",
-            "고령화율(%)",
-        ]
-    ].copy()
+with st.expander("📊 시군구별 비율 표 보기"):
 
-    table = table.sort_values(
-        "고령화율(%)",
-        ascending=False,
-    )
+    if matched_data.empty:
 
-    table["65세 이상 인구"] = (
-        table["65세 이상 인구"]
-        .round()
-        .astype("int64")
-    )
+        st.info(
+            "선택한 지역에 표시할 인구 통계가 없습니다."
+        )
 
-    table["전체 인구"] = (
-        table["전체 인구"]
-        .round()
-        .astype("int64")
-    )
+    else:
 
-    table["고령화율(%)"] = (
-        table["고령화율(%)"]
-        .round(2)
-    )
+        table = matched_data[
+            [
+                "시도",
+                "시군구",
+                "코드",
+                "지표 인구",
+                "전체 인구",
+                "_비율",
+            ]
+        ].copy()
 
-    st.dataframe(
-        table,
-        use_container_width=True,
-        hide_index=True,
-    )
+        table = table.sort_values(
+            "_비율",
+            ascending=False,
+        )
+
+        table = table.rename(
+            columns={
+                "_비율": metric_table_label,
+            }
+        )
+
+        table["지표 인구"] = (
+            table["지표 인구"]
+            .round()
+            .astype("int64")
+        )
+
+        table["전체 인구"] = (
+            table["전체 인구"]
+            .round()
+            .astype("int64")
+        )
+
+        table[metric_table_label] = (
+            table[metric_table_label]
+            .round(2)
+        )
+
+        st.dataframe(
+            table,
+            use_container_width=True,
+            hide_index=True,
+        )
